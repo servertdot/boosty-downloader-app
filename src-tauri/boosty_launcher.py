@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import contextvars
 import json
+import os
 import re
-import sys
+import shutil
 import time
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
@@ -19,6 +21,8 @@ from boosty_downloader.application.use_cases.download_single_post import (
     DownloadSinglePostUseCase,
 )
 from boosty_downloader.infrastructure.external_videos_downloader.external_videos_downloader import (
+    ExtVideoDownloadError,
+    ExtVideoInfoError,
     ExternalVideosDownloader,
 )
 
@@ -32,6 +36,31 @@ _boosty_referer: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 _original_download_external_video = DownloadSinglePostUseCase.download_external_videos
 _original_download_video = ExternalVideosDownloader.download_video
+_original_ydl_options = dict(ExternalVideosDownloader._default_ydl_options)
+
+
+def _resolve_ffmpeg() -> str | None:
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def _ensure_ffmpeg_on_path() -> str | None:
+    ffmpeg = _resolve_ffmpeg()
+    if not ffmpeg:
+        return None
+    ffmpeg_dir = str(Path(ffmpeg).resolve().parent)
+    current = os.environ.get("PATH", "")
+    parts = current.split(os.pathsep) if current else []
+    if ffmpeg_dir not in parts:
+        os.environ["PATH"] = ffmpeg_dir + (os.pathsep + current if current else "")
+    return ffmpeg
 
 
 def _vimeo_player_url(url: str) -> str | None:
@@ -84,14 +113,47 @@ def _download_video_with_vimeo_embed(
 ):
     player_url = _vimeo_player_url(url)
     referer = _boosty_referer.get()
+    ffmpeg = _ensure_ffmpeg_on_path()
     if player_url and referer:
         url = smuggle_url(player_url, {"referer": referer})
-    return _original_download_video(
-        self,
-        url=url,
-        destination_directory=destination_directory,
-        progress_hook=progress_hook,
-    )
+
+    options = dict(_original_ydl_options)
+    if referer:
+        options["http_headers"] = {
+            **dict(options.get("http_headers") or {}),
+            "Referer": referer,
+            "Origin": "https://boosty.to",
+        }
+    if ffmpeg:
+        options["ffmpeg_location"] = ffmpeg
+    else:
+        print(
+            "✖ Не найден ffmpeg. Без него нельзя скачать внешние видео (Vimeo/YouTube). "
+            "Нажмите «Установить» в приложении ещё раз.",
+            flush=True,
+        )
+
+    ExternalVideosDownloader._default_ydl_options = options
+    try:
+        return _original_download_video(
+            self,
+            url=url,
+            destination_directory=destination_directory,
+            progress_hook=progress_hook,
+        )
+    except (ExtVideoInfoError, ExtVideoDownloadError) as error:
+        cause = error.__cause__ or error.__context__
+        detail = str(cause).strip() if cause else str(error).strip()
+        if detail:
+            print(f"✖ yt-dlp: {detail}", flush=True)
+        if not ffmpeg and "ffmpeg" in detail.lower():
+            print(
+                "✖ Нажмите «Установить» в Boosty Loader — ffmpeg будет добавлен автоматически.",
+                flush=True,
+            )
+        raise
+    finally:
+        ExternalVideosDownloader._default_ydl_options = dict(_original_ydl_options)
 
 
 DownloadSinglePostUseCase.download_external_videos = (
@@ -284,6 +346,12 @@ def _install_desktop_progress_reporter() -> None:
 
 
 if __name__ == "__main__":
+    ffmpeg = _ensure_ffmpeg_on_path()
+    if ffmpeg:
+        print(f"ffmpeg: {ffmpeg}", flush=True)
+    else:
+        print("⚠ ffmpeg не найден — внешние видео могут не скачаться", flush=True)
+
     _install_desktop_progress_reporter()
     from boosty_downloader.main import entry_point
 

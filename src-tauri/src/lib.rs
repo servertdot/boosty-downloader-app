@@ -182,6 +182,31 @@ fn certifi_bundle(app: &AppHandle) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+fn has_ffmpeg_helper(app: &AppHandle) -> bool {
+    let python = managed_python(app).ok();
+    let Some(python) = python else {
+        return false;
+    };
+    let script = "import shutil, sys\n\
+ok = bool(shutil.which('ffmpeg'))\n\
+if not ok:\n\
+    try:\n\
+        import imageio_ffmpeg\n\
+        ok = bool(imageio_ffmpeg.get_ffmpeg_exe())\n\
+    except Exception:\n\
+        ok = False\n\
+sys.exit(0 if ok else 1)";
+    Command::new(python)
+        .args(["-c", script])
+        .output()
+        .ok()
+        .is_some_and(|output| output.status.success())
+}
+
+fn runtime_ready(app: &AppHandle) -> bool {
+    find_downloader(app).is_some() && certifi_bundle(app).is_some() && has_ffmpeg_helper(app)
+}
+
 fn json_scalar(value: &str) -> Result<String, String> {
     serde_json::to_string(value).map_err(|error| error.to_string())
 }
@@ -525,6 +550,7 @@ fn install_with_uv(app: &AppHandle, venv: &Path) -> Result<(), String> {
         "--upgrade",
         "boosty-downloader",
         "certifi",
+        "imageio-ffmpeg",
     ]);
     pip_command.env("UV_PYTHON_INSTALL_DIR", &python_home);
     if let Some(path) = executable_search_path() {
@@ -688,14 +714,8 @@ fn save_settings(app: AppHandle, settings: AppSettings) -> Result<(), String> {
 #[tauri::command]
 fn runtime_status(app: AppHandle, state: State<'_, DownloaderState>) -> RuntimeStatus {
     let installed = find_downloader(&app);
-    let managed_program = managed_binary(&app).ok();
-    let has_required_ca = installed.as_ref().is_none_or(|(spec, _)| {
-        managed_program.as_ref().is_none_or(|path| {
-            spec.program != path.to_string_lossy() || certifi_bundle(&app).is_some()
-        })
-    });
     RuntimeStatus {
-        installed: installed.is_some() && has_required_ca,
+        installed: runtime_ready(&app),
         version: installed.map(|(_, version)| version),
         running: state
             .0
@@ -721,9 +741,9 @@ fn install_downloader(app: AppHandle) -> Result<String, String> {
         )
     })?;
 
-    if find_downloader(&app).is_none() || certifi_bundle(&app).is_none() {
+    if !runtime_ready(&app) {
         return Err(format!(
-            "Boosty Loader {APP_VERSION}: установка завершилась, но Boosty Downloader не найден. Нажмите «Установить» ещё раз."
+            "Boosty Loader {APP_VERSION}: установка завершилась, но runtime не готов (downloader/certifi/ffmpeg). Нажмите «Установить» ещё раз."
         ));
     }
 
@@ -959,5 +979,7 @@ mod tests {
         assert!(BOOSTY_LAUNCHER.contains("boosty_referer"));
         assert!(BOOSTY_LAUNCHER.contains(PROGRESS_PREFIX));
         assert!(BOOSTY_LAUNCHER.contains("DesktopProgressReporter"));
+        assert!(BOOSTY_LAUNCHER.contains("imageio_ffmpeg"));
+        assert!(BOOSTY_LAUNCHER.contains("ffmpeg_location"));
     }
 }
