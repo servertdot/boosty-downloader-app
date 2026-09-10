@@ -37,7 +37,24 @@ Made possible by the open-source project
 - Live log, stop mid-run, and resume sync later
 - Isolated Python environment — your system packages stay untouched
 
-## Quick start
+## Download (macOS)
+
+Grab a DMG from the [latest release](https://github.com/servertdot/boosty-downloader-app/releases/latest):
+
+- **Apple Silicon** (M1/M2/M3/M4): `Boosty-Loader_*_aarch64.dmg`
+- **Intel**: `Boosty-Loader_*_x64.dmg`
+
+Open the DMG, drag **Boosty Loader** into Applications, then launch it.
+
+The build is ad-hoc signed (not Apple-notarized). On first launch, use **right-click → Open** and confirm in the dialog. If macOS still says the app is damaged:
+
+```bash
+xattr -cr "/Applications/Boosty Loader.app"
+```
+
+Then open it again. On first launch inside the app, click **Install** to set up the isolated Python environment.
+
+## Quick start (from source)
 
 You need **Rust**, **Bun**, and **Python 3.10+**.
 
