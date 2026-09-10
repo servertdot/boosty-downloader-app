@@ -20,7 +20,7 @@ const LAUNCHER_FILE: &str = "boosty_launcher.py";
 const BOOSTY_LAUNCHER: &str = include_str!("../boosty_launcher.py");
 const MANAGED_PYTHON: &str = "3.12";
 const UV_VERSION: &str = "0.8.4";
-const MIN_PYTHON_MINOR: u32 = 10;
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,6 +70,7 @@ struct RuntimeStatus {
     installed: bool,
     version: Option<String>,
     running: bool,
+    app_version: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -266,8 +267,12 @@ fn find_downloader(app: &AppHandle) -> Option<(CommandSpec, String)> {
 }
 
 fn command_output(program: impl AsRef<Path>, args: &[&str]) -> Result<std::process::Output, String> {
-    Command::new(program.as_ref())
-        .args(args)
+    let mut command = Command::new(program.as_ref());
+    command.args(args);
+    if let Some(path) = executable_search_path() {
+        command.env("PATH", path);
+    }
+    command
         .output()
         .map_err(|error| format!("Не удалось запустить {}: {error}", program.as_ref().display()))
 }
@@ -286,54 +291,6 @@ fn command_succeeded(program: impl AsRef<Path>, args: &[&str], context: &str) ->
     }
 }
 
-fn parse_python_version(raw: &str) -> Option<(u32, u32)> {
-    let mut parts = raw
-        .split(|ch: char| !ch.is_ascii_digit())
-        .filter(|part| !part.is_empty());
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    Some((major, minor))
-}
-
-fn python_version(program: &str) -> Option<(u32, u32)> {
-    let output = Command::new(program)
-        .args(["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_python_version(String::from_utf8_lossy(&output.stdout).trim())
-}
-
-fn is_compatible_python(program: &str) -> bool {
-    python_version(program).is_some_and(|(major, minor)| major == 3 && minor >= MIN_PYTHON_MINOR)
-}
-
-fn find_compatible_python() -> Option<String> {
-    [
-        "python3.13",
-        "python3.12",
-        "python3.11",
-        "python3.10",
-        "python3",
-        "python",
-        "py",
-    ]
-    .into_iter()
-    .find(|candidate| is_compatible_python(candidate))
-    .map(str::to_string)
-}
-
-fn venv_python_compatible(venv: &Path) -> bool {
-    let python = if cfg!(windows) {
-        venv.join("Scripts").join("python.exe")
-    } else {
-        venv.join("bin").join("python")
-    };
-    python.is_file() && is_compatible_python(&python.to_string_lossy())
-}
-
 fn remove_path(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
@@ -345,8 +302,27 @@ fn remove_path(path: &Path) -> Result<(), String> {
     }
 }
 
+fn clear_quarantine(path: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("/usr/bin/xattr")
+            .args(["-dr", "com.apple.quarantine"])
+            .arg(path)
+            .output();
+    }
+}
+
 fn uv_binary(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(runtime_dir(app)?.join(if cfg!(windows) { "uv.exe" } else { "uv" }))
+}
+
+fn bundled_uv_path(app: &AppHandle) -> Option<PathBuf> {
+    let resource_dir = app.path().resource_dir().ok()?;
+    let candidates = [
+        resource_dir.join(if cfg!(windows) { "uv.exe" } else { "uv" }),
+        resource_dir.join("resources").join(if cfg!(windows) { "uv.exe" } else { "uv" }),
+    ];
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 fn uv_download_target() -> Result<(&'static str, &'static str), String> {
@@ -359,13 +335,18 @@ fn uv_download_target() -> Result<(&'static str, &'static str), String> {
         ("windows", "x86_64") => Ok(("uv-x86_64-pc-windows-msvc.zip", "uv.exe")),
         ("windows", "aarch64") => Ok(("uv-aarch64-pc-windows-msvc.zip", "uv.exe")),
         _ => Err(format!(
-            "Автоустановка Python не поддерживается для {}-{arch}. Установите Python 3.10+ вручную.",
+            "Автоустановка Python не поддерживается для {}-{arch}.",
             env::consts::OS
         )),
     }
 }
 
 fn download_file(url: &str, destination: &Path) -> Result<(), String> {
+    let curl = if Path::new("/usr/bin/curl").is_file() {
+        PathBuf::from("/usr/bin/curl")
+    } else {
+        PathBuf::from("curl")
+    };
     if cfg!(windows) {
         command_succeeded(
             "powershell",
@@ -383,7 +364,7 @@ fn download_file(url: &str, destination: &Path) -> Result<(), String> {
         )?;
     } else {
         command_succeeded(
-            "curl",
+            &curl,
             &["-fsSL", url, "-o", &destination.to_string_lossy()],
             "Не удалось скачать вспомогательный установщик",
         )?;
@@ -410,8 +391,13 @@ fn extract_uv_archive(archive: &Path, extract_dir: &Path, binary_name: &str) -> 
             "Не удалось распаковать вспомогательный установщик",
         )?;
     } else {
+        let tar = if Path::new("/usr/bin/tar").is_file() {
+            PathBuf::from("/usr/bin/tar")
+        } else {
+            PathBuf::from("tar")
+        };
         command_succeeded(
-            "tar",
+            &tar,
             &[
                 "-xzf",
                 &archive.to_string_lossy(),
@@ -438,14 +424,39 @@ fn extract_uv_archive(archive: &Path, extract_dir: &Path, binary_name: &str) -> 
     Err("В архиве установщика не найден исполняемый файл uv".into())
 }
 
+fn install_uv_binary(app: &AppHandle, source: &Path) -> Result<PathBuf, String> {
+    let binary = uv_binary(app)?;
+    if let Some(parent) = binary.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    remove_path(&binary)?;
+    fs::copy(source, &binary).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
+            .map_err(|error| error.to_string())?;
+    }
+    clear_quarantine(&binary);
+    Ok(binary)
+}
+
 fn ensure_uv(app: &AppHandle) -> Result<PathBuf, String> {
     let binary = uv_binary(app)?;
-    if binary.is_file()
-        && command_output(&binary, &["--version"])
+    if binary.is_file() {
+        clear_quarantine(&binary);
+        if command_output(&binary, &["--version"])
             .map(|output| output.status.success())
             .unwrap_or(false)
-    {
-        return Ok(binary);
+        {
+            return Ok(binary);
+        }
+    }
+
+    if let Some(bundled) = bundled_uv_path(app) {
+        emit(app, "log", "Подключаю встроенный установщик Python…");
+        clear_quarantine(&bundled);
+        return install_uv_binary(app, &bundled);
     }
 
     emit(app, "log", "Скачиваю встроенный установщик Python…");
@@ -461,90 +472,75 @@ fn ensure_uv(app: &AppHandle) -> Result<PathBuf, String> {
     );
     download_file(&url, &archive)?;
     let extracted = extract_uv_archive(&archive, &extract_dir, binary_name)?;
-    remove_path(&binary)?;
-    fs::copy(&extracted, &binary).map_err(|error| error.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
-            .map_err(|error| error.to_string())?;
-    }
+    let installed = install_uv_binary(app, &extracted)?;
     let _ = fs::remove_file(&archive);
     remove_path(&extract_dir)?;
-    Ok(binary)
+    Ok(installed)
 }
 
 fn install_with_uv(app: &AppHandle, venv: &Path) -> Result<(), String> {
     let uv = ensure_uv(app)?;
+    let python_home = runtime_dir(app)?.join("python");
+    fs::create_dir_all(&python_home).map_err(|error| error.to_string())?;
     remove_path(venv)?;
+
     emit(
         app,
         "log",
         format!("Готовлю изолированный Python {MANAGED_PYTHON}…"),
     );
-    command_succeeded(
-        &uv,
-        &[
-            "venv",
-            "--python",
-            MANAGED_PYTHON,
-            "--seed",
-            &venv.to_string_lossy(),
-        ],
-        "Не удалось создать окружение Python",
-    )?;
+
+    let mut venv_command = Command::new(&uv);
+    venv_command.args([
+        "venv",
+        "--python",
+        MANAGED_PYTHON,
+        "--python-preference",
+        "only-managed",
+        "--seed",
+        &venv.to_string_lossy(),
+    ]);
+    venv_command.env("UV_PYTHON_INSTALL_DIR", &python_home);
+    if let Some(path) = executable_search_path() {
+        venv_command.env("PATH", path);
+    }
+    let created = venv_command
+        .output()
+        .map_err(|error| format!("Не удалось создать окружение Python: {error}"))?;
+    if !created.status.success() {
+        return Err(format!(
+            "Не удалось создать окружение Python.\n{}",
+            String::from_utf8_lossy(&created.stderr).trim()
+        ));
+    }
 
     let python = managed_python(app)?;
     emit(app, "log", "Устанавливаю boosty-downloader…");
-    command_succeeded(
-        &uv,
-        &[
-            "pip",
-            "install",
-            "--python",
-            &python.to_string_lossy(),
-            "--upgrade",
-            "boosty-downloader",
-            "certifi",
-        ],
-        "Не удалось установить boosty-downloader",
-    )?;
-    Ok(())
-}
-
-fn install_with_system_python(app: &AppHandle, python: &str, venv: &Path) -> Result<(), String> {
-    if !venv_python_compatible(venv) {
-        remove_path(venv)?;
+    let mut pip_command = Command::new(&uv);
+    pip_command.args([
+        "pip",
+        "install",
+        "--python",
+        &python.to_string_lossy(),
+        "--upgrade",
+        "boosty-downloader",
+        "certifi",
+    ]);
+    pip_command.env("UV_PYTHON_INSTALL_DIR", &python_home);
+    if let Some(path) = executable_search_path() {
+        pip_command.env("PATH", path);
     }
-    if !venv.exists() {
-        emit(app, "log", "Создаю изолированное окружение Python…");
-        command_succeeded(
-            python,
-            &["-m", "venv", &venv.to_string_lossy()],
-            "Не удалось создать окружение Python",
-        )?;
+    let installed = pip_command
+        .output()
+        .map_err(|error| format!("Не удалось установить boosty-downloader: {error}"))?;
+    if !installed.status.success() {
+        let stderr = String::from_utf8_lossy(&installed.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&installed.stdout).trim().to_string();
+        return Err(format!(
+            "Не удалось установить boosty-downloader.\n{}",
+            if stderr.is_empty() { stdout } else { stderr }
+        ));
     }
-
-    let venv_python = managed_python(app)?;
-    emit(app, "log", "Обновляю pip…");
-    command_succeeded(
-        &venv_python,
-        &["-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"],
-        "Не удалось обновить pip",
-    )?;
-    emit(app, "log", "Устанавливаю boosty-downloader…");
-    command_succeeded(
-        &venv_python,
-        &[
-            "-m",
-            "pip",
-            "install",
-            "--upgrade",
-            "boosty-downloader",
-            "certifi",
-        ],
-        "Не удалось установить boosty-downloader",
-    )?;
     Ok(())
 }
 
@@ -706,49 +702,32 @@ fn runtime_status(app: AppHandle, state: State<'_, DownloaderState>) -> RuntimeS
             .lock()
             .map(|value| value.child.is_some())
             .unwrap_or(false),
+        app_version: APP_VERSION.into(),
     }
 }
 
 #[tauri::command]
 fn install_downloader(app: AppHandle) -> Result<String, String> {
     let venv = venv_dir(&app)?;
-    emit(&app, "log", "Готовлю Boosty Downloader…");
+    emit(
+        &app,
+        "log",
+        format!("Boosty Loader {APP_VERSION}: готовлю изолированный runtime…"),
+    );
 
-    let system_python = find_compatible_python();
-    let result = match system_python.as_deref() {
-        Some(python) => match install_with_system_python(&app, python, &venv) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                emit(
-                    &app,
-                    "log",
-                    "Системный Python не подошёл, пробую встроенную установку…",
-                );
-                install_with_uv(&app, &venv).map_err(|fallback| {
-                    format!("{error}\n\nРезервная установка тоже не удалась:\n{fallback}")
-                })
-            }
-        },
-        None => {
-            emit(
-                &app,
-                "log",
-                "Подходящий Python не найден — ставлю изолированный runtime…",
-            );
-            install_with_uv(&app, &venv)
-        }
-    };
-
-    result?;
+    install_with_uv(&app, &venv).map_err(|error| {
+        format!(
+            "Boosty Loader {APP_VERSION}: установка не удалась.\n{error}\n\nУдалите папку Application Support/com.author.boosty-loader/downloader и нажмите «Установить» ещё раз."
+        )
+    })?;
 
     if find_downloader(&app).is_none() || certifi_bundle(&app).is_none() {
-        return Err(
-            "Установка завершилась, но Boosty Downloader не найден. Нажмите «Установить» ещё раз."
-                .into(),
-        );
+        return Err(format!(
+            "Boosty Loader {APP_VERSION}: установка завершилась, но Boosty Downloader не найден. Нажмите «Установить» ещё раз."
+        ));
     }
 
-    Ok("Boosty Downloader готов к работе".into())
+    Ok(format!("Boosty Downloader готов к работе (Loader {APP_VERSION})"))
 }
 
 #[tauri::command]
@@ -972,13 +951,6 @@ mod tests {
 
         assert!(std::env::split_paths(executable_path)
             .any(|path| path == Path::new("/opt/homebrew/bin")));
-    }
-
-    #[test]
-    fn parses_python_version_strings() {
-        assert_eq!(parse_python_version("3.12"), Some((3, 12)));
-        assert_eq!(parse_python_version("Python 3.9.6"), Some((3, 9)));
-        assert_eq!(parse_python_version("nope"), None);
     }
 
     #[test]

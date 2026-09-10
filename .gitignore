@@ -12,6 +12,10 @@ dist
 dist-ssr
 graphify-out
 src-tauri/target
+src-tauri/resources/uv
+src-tauri/resources/uv.exe
+src-tauri/resources/.uv-*
+src-tauri/resources/uv-staging
 *.local
 
 # Editor directories and files

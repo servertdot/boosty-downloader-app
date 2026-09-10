@@ -11,7 +11,7 @@ type Settings = {
   postUrl: string; preferredVideoQuality: string; contentTypes: ContentType[];
   requestDelaySeconds: number; skipAllFailures: boolean;
 };
-type RuntimeStatus = { installed: boolean; version: string | null; running: boolean };
+type RuntimeStatus = { installed: boolean; version: string | null; running: boolean; appVersion: string };
 type DownloadEvent = {
   kind: "started" | "log" | "error" | "completed" | "failed" | "cancelled" | "progress";
   message: string;
@@ -56,7 +56,7 @@ const authHelperScript = `(function () {
   console.log("Boosty Loader: данные появятся в правом верхнем углу. Прокрутите страницу, если блок ещё не виден.");
 })();`;
 
-const emptyStatus: RuntimeStatus = { installed: false, version: null, running: false };
+const emptyStatus: RuntimeStatus = { installed: false, version: null, running: false, appVersion: "" };
 const ansiPattern = /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d\/#&.:=?%@~_]+)*)?\u0007)|(?:(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
 
 function Icon({ name }: { name: "download" | "folder" | "key" | "terminal" | "check" | "stop" | "copy" | "eye" }) {
@@ -142,7 +142,7 @@ function App() {
   if (!settings) return <main className="loading"><span className="spinner" />Загружаем настройки…</main>;
 
   return <main className="app-shell">
-    <header className="topbar"><div className="brand"><div className="brand-mark"><img src="/app-icon.png" alt="" width={42} height={42} /></div><div><strong>Boosty Loader</strong><span>Сохраняйте доступный вам контент</span></div></div><div className={`runtime-pill ${runtime.installed ? "ready" : "missing"}`}><span className="status-dot" />{runtime.installed ? `Downloader ${runtime.version ?? "готов"}` : busy ? "Установка…" : "Downloader не установлен"}{!runtime.installed && <button className="text-button" onClick={install} disabled={busy}>{busy ? "Подождите" : "Установить"}</button>}</div></header>
+    <header className="topbar"><div className="brand"><div className="brand-mark"><img src="/app-icon.png" alt="" width={42} height={42} /></div><div><strong>Boosty Loader</strong><span>Сохраняйте доступный вам контент{runtime.appVersion ? ` · v${runtime.appVersion}` : ""}</span></div></div><div className={`runtime-pill ${runtime.installed ? "ready" : "missing"}`}><span className="status-dot" />{runtime.installed ? `Downloader ${runtime.version ?? "готов"}` : busy ? "Установка…" : "Downloader не установлен"}{!runtime.installed && <button className="text-button" onClick={install} disabled={busy}>{busy ? "Подождите" : "Установить"}</button>}</div></header>
     <div className="workspace"><section className="main-column">
       <div className="intro"><span className="eyebrow">Новая загрузка</span><h1>Загрузите материалы автора</h1><p>Приложение синхронизирует новые публикации и пропустит то, что уже было сохранено.</p></div>
       {(notice || error) && <div className={`notice ${error ? "notice-error" : "notice-success"}`}><Icon name={error ? "stop" : "check"} /><span>{error || notice}</span><button aria-label="Закрыть" onClick={() => { setNotice(""); setError(""); }}>×</button></div>}
