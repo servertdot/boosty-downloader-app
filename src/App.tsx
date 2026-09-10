@@ -82,10 +82,12 @@ function App() {
   const logId = useRef(0); const logEnd = useRef<HTMLDivElement>(null);
 
   const refreshStatus = async () => setRuntime(await invoke<RuntimeStatus>("runtime_status"));
-  const installAttempted = useRef(false);
+  const installLock = useRef(false);
 
   const install = async () => {
-    setBusy(true); setError(""); setNotice("Устанавливаю Boosty Downloader…");
+    if (installLock.current) return;
+    installLock.current = true;
+    setBusy(true); setError(""); setNotice("Устанавливаю компоненты… Это может занять несколько минут.");
     try {
       await invoke<string>("install_downloader");
       await refreshStatus();
@@ -94,21 +96,21 @@ function App() {
       setError(String(reason));
       setNotice("");
     } finally {
+      installLock.current = false;
       setBusy(false);
     }
   };
 
   useEffect(() => {
+    let cancelled = false;
     void Promise.all([invoke<Settings>("load_settings"), invoke<RuntimeStatus>("runtime_status")])
       .then(([saved, status]) => {
+        if (cancelled) return;
         setSettings(saved);
         setRuntime(status);
-        if (!status.installed && !installAttempted.current) {
-          installAttempted.current = true;
-          void install();
-        }
+        if (!status.installed) void install();
       })
-      .catch((reason) => setError(String(reason)));
+      .catch((reason) => { if (!cancelled) setError(String(reason)); });
     const unsubscribe = listen<DownloadEvent>("download-event", ({ payload }) => {
       const cleaned = { ...payload, message: payload.message.replace(ansiPattern, "") };
       if (cleaned.kind === "progress") {
@@ -120,11 +122,11 @@ function App() {
       if (["completed", "failed", "cancelled"].includes(cleaned.kind)) setProgress(null);
       if (["started", "completed", "failed", "cancelled"].includes(cleaned.kind)) void refreshStatus();
     });
-    return () => { void unsubscribe.then((fn) => fn()); };
+    return () => { cancelled = true; void unsubscribe.then((fn) => fn()); };
   }, []);
   useEffect(() => { logEnd.current?.scrollIntoView({ behavior: "smooth" }); }, [logs]);
 
-  const canStart = useMemo(() => Boolean(settings?.username.trim() && settings.authHeader.trim() && settings.cookie.trim() && settings.destinationDirectory.trim() && settings.contentTypes.length && runtime.installed && !runtime.running), [settings, runtime]);
+  const canStart = useMemo(() => Boolean(settings?.username.trim() && settings.authHeader.trim() && settings.cookie.trim() && settings.contentTypes.length && runtime.installed && !runtime.running && settings.destinationDirectory.trim()), [settings, runtime]);
   const patchSettings = <K extends keyof Settings>(key: K, value: Settings[K]) => { setSettings((current) => current ? { ...current, [key]: value } : current); setNotice(""); setError(""); };
   const toggleContent = (value: ContentType) => { if (settings) patchSettings("contentTypes", settings.contentTypes.includes(value) ? settings.contentTypes.filter((item) => item !== value) : [...settings.contentTypes, value]); };
 

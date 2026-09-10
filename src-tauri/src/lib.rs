@@ -105,6 +105,7 @@ fn default_progress_active() -> bool {
 struct ProcessState {
     child: Option<Child>,
     cancelled: bool,
+    installing: bool,
 }
 
 struct DownloaderState(Mutex<ProcessState>);
@@ -170,6 +171,20 @@ fn prepare_download_command(app: &AppHandle, spec: CommandSpec) -> Result<Comman
     })
 }
 
+fn managed_tools_bin(app: &AppHandle) -> Result<PathBuf, String> {
+    let directory = runtime_dir(app)?.join("bin");
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    Ok(directory)
+}
+
+fn managed_ffmpeg(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(managed_tools_bin(app)?.join(if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    }))
+}
+
 fn certifi_bundle(app: &AppHandle) -> Option<PathBuf> {
     let output = Command::new(managed_python(app).ok()?)
         .args(["-c", "import certifi; print(certifi.where())"])
@@ -183,28 +198,137 @@ fn certifi_bundle(app: &AppHandle) -> Option<PathBuf> {
 }
 
 fn has_ffmpeg_helper(app: &AppHandle) -> bool {
-    let python = managed_python(app).ok();
-    let Some(python) = python else {
+    managed_ffmpeg(app)
+        .ok()
+        .is_some_and(|path| path.is_file())
+        || executable_search_path().is_some_and(|path| {
+            env::split_paths(&path).any(|dir| {
+                dir.join(if cfg!(windows) {
+                    "ffmpeg.exe"
+                } else {
+                    "ffmpeg"
+                })
+                .is_file()
+            })
+        })
+}
+
+fn runtime_ready(app: &AppHandle) -> bool {
+    find_downloader(app).is_some() && certifi_bundle(app).is_some() && has_ffmpeg_helper(app)
+}
+
+fn venv_python_ready(app: &AppHandle) -> bool {
+    let Ok(python) = managed_python(app) else {
         return false;
     };
-    let script = "import shutil, sys\n\
-ok = bool(shutil.which('ffmpeg'))\n\
-if not ok:\n\
-    try:\n\
-        import imageio_ffmpeg\n\
-        ok = bool(imageio_ffmpeg.get_ffmpeg_exe())\n\
-    except Exception:\n\
-        ok = False\n\
-sys.exit(0 if ok else 1)";
-    Command::new(python)
-        .args(["-c", script])
+    if !python.is_file() {
+        return false;
+    }
+    Command::new(&python)
+        .args([
+            "-c",
+            "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 10) else 1)",
+        ])
         .output()
         .ok()
         .is_some_and(|output| output.status.success())
 }
 
-fn runtime_ready(app: &AppHandle) -> bool {
-    find_downloader(app).is_some() && certifi_bundle(app).is_some() && has_ffmpeg_helper(app)
+fn run_logged_command(
+    app: &AppHandle,
+    mut command: Command,
+    context: &str,
+) -> Result<(), String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("{context}: {error}"))?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let app_out = app.clone();
+    let app_err = app.clone();
+    let out_thread = thread::spawn(move || {
+        if let Some(stdout) = stdout {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    emit(&app_out, "log", trimmed);
+                }
+            }
+        }
+    });
+    let err_thread = thread::spawn(move || {
+        if let Some(stderr) = stderr {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    emit(&app_err, "log", trimmed);
+                }
+            }
+        }
+    });
+
+    let status = child
+        .wait()
+        .map_err(|error| format!("{context}: {error}"))?;
+    let _ = out_thread.join();
+    let _ = err_thread.join();
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{context} (код {})",
+            status.code().unwrap_or(-1)
+        ))
+    }
+}
+
+fn ensure_local_ffmpeg(app: &AppHandle) -> Result<(), String> {
+    let destination = managed_ffmpeg(app)?;
+    if destination.is_file() {
+        return Ok(());
+    }
+
+    emit(app, "log", "Скачиваю ffmpeg для внешних видео (Vimeo/YouTube)…");
+    let python = managed_python(app)?;
+    let script = "import shutil, sys\n\
+from pathlib import Path\n\
+dest = Path(sys.argv[1])\n\
+src = None\n\
+found = shutil.which('ffmpeg')\n\
+if found:\n\
+    src = Path(found)\n\
+else:\n\
+    import imageio_ffmpeg\n\
+    src = Path(imageio_ffmpeg.get_ffmpeg_exe())\n\
+dest.parent.mkdir(parents=True, exist_ok=True)\n\
+shutil.copy2(src, dest)\n\
+print(dest)";
+    let output = Command::new(&python)
+        .args(["-c", script])
+        .arg(&destination)
+        .output()
+        .map_err(|error| format!("Не удалось подготовить ffmpeg: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Не удалось подготовить ffmpeg.\n{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))
+            .map_err(|error| error.to_string())?;
+    }
+    clear_quarantine(&destination);
+    emit(
+        app,
+        "log",
+        format!("ffmpeg готов: {}", destination.display()),
+    );
+    Ok(())
 }
 
 fn json_scalar(value: &str) -> Result<String, String> {
@@ -507,40 +631,39 @@ fn install_with_uv(app: &AppHandle, venv: &Path) -> Result<(), String> {
     let uv = ensure_uv(app)?;
     let python_home = runtime_dir(app)?.join("python");
     fs::create_dir_all(&python_home).map_err(|error| error.to_string())?;
-    remove_path(venv)?;
 
-    emit(
-        app,
-        "log",
-        format!("Готовлю изолированный Python {MANAGED_PYTHON}…"),
-    );
-
-    let mut venv_command = Command::new(&uv);
-    venv_command.args([
-        "venv",
-        "--python",
-        MANAGED_PYTHON,
-        "--python-preference",
-        "only-managed",
-        "--seed",
-        &venv.to_string_lossy(),
-    ]);
-    venv_command.env("UV_PYTHON_INSTALL_DIR", &python_home);
-    if let Some(path) = executable_search_path() {
-        venv_command.env("PATH", path);
-    }
-    let created = venv_command
-        .output()
-        .map_err(|error| format!("Не удалось создать окружение Python: {error}"))?;
-    if !created.status.success() {
-        return Err(format!(
-            "Не удалось создать окружение Python.\n{}",
-            String::from_utf8_lossy(&created.stderr).trim()
-        ));
+    if venv_python_ready(app) {
+        emit(app, "log", "Найдено готовое окружение Python — обновляю пакеты…");
+    } else {
+        remove_path(venv)?;
+        emit(
+            app,
+            "log",
+            format!("Готовлю изолированный Python {MANAGED_PYTHON}…"),
+        );
+        let mut venv_command = Command::new(&uv);
+        venv_command.args([
+            "venv",
+            "--python",
+            MANAGED_PYTHON,
+            "--python-preference",
+            "only-managed",
+            "--seed",
+            &venv.to_string_lossy(),
+        ]);
+        venv_command.env("UV_PYTHON_INSTALL_DIR", &python_home);
+        if let Some(path) = executable_search_path() {
+            venv_command.env("PATH", path);
+        }
+        run_logged_command(app, venv_command, "Не удалось создать окружение Python")?;
     }
 
     let python = managed_python(app)?;
-    emit(app, "log", "Устанавливаю boosty-downloader…");
+    emit(
+        app,
+        "log",
+        "Устанавливаю boosty-downloader, certifi и imageio-ffmpeg…",
+    );
     let mut pip_command = Command::new(&uv);
     pip_command.args([
         "pip",
@@ -556,17 +679,8 @@ fn install_with_uv(app: &AppHandle, venv: &Path) -> Result<(), String> {
     if let Some(path) = executable_search_path() {
         pip_command.env("PATH", path);
     }
-    let installed = pip_command
-        .output()
-        .map_err(|error| format!("Не удалось установить boosty-downloader: {error}"))?;
-    if !installed.status.success() {
-        let stderr = String::from_utf8_lossy(&installed.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&installed.stdout).trim().to_string();
-        return Err(format!(
-            "Не удалось установить boosty-downloader.\n{}",
-            if stderr.is_empty() { stdout } else { stderr }
-        ));
-    }
+    run_logged_command(app, pip_command, "Не удалось установить пакеты")?;
+    ensure_local_ffmpeg(app)?;
     Ok(())
 }
 
@@ -660,6 +774,7 @@ fn build_process_command(
     args: &[String],
     working_directory: &Path,
     ca_bundle: Option<&Path>,
+    extra_bin_dir: Option<&Path>,
 ) -> Command {
     let mut command = Command::new(&spec.program);
     command
@@ -670,7 +785,7 @@ fn build_process_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(executable_path) = executable_search_path() {
+    if let Some(executable_path) = path_with_extra_bin(extra_bin_dir) {
         command.env("PATH", executable_path);
     }
     if let Some(ca_bundle) = ca_bundle {
@@ -679,21 +794,26 @@ fn build_process_command(
     command
 }
 
-fn executable_search_path() -> Option<OsString> {
+fn path_with_extra_bin(extra_bin_dir: Option<&Path>) -> Option<OsString> {
     let mut directories = Vec::<PathBuf>::new();
-
+    if let Some(extra) = extra_bin_dir {
+        directories.push(extra.to_path_buf());
+    }
     #[cfg(target_os = "macos")]
     directories.extend([
         PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/usr/local/bin"),
         PathBuf::from("/opt/local/bin"),
     ]);
-
     if let Some(current_path) = env::var_os("PATH") {
         directories.extend(env::split_paths(&current_path));
     }
     directories.dedup();
     env::join_paths(directories).ok()
+}
+
+fn executable_search_path() -> Option<OsString> {
+    path_with_extra_bin(None)
 }
 
 #[tauri::command]
@@ -727,27 +847,52 @@ fn runtime_status(app: AppHandle, state: State<'_, DownloaderState>) -> RuntimeS
 }
 
 #[tauri::command]
-fn install_downloader(app: AppHandle) -> Result<String, String> {
-    let venv = venv_dir(&app)?;
-    emit(
-        &app,
-        "log",
-        format!("Boosty Loader {APP_VERSION}: готовлю изолированный runtime…"),
-    );
-
-    install_with_uv(&app, &venv).map_err(|error| {
-        format!(
-            "Boosty Loader {APP_VERSION}: установка не удалась.\n{error}\n\nУдалите папку Application Support/com.author.boosty-loader/downloader и нажмите «Установить» ещё раз."
-        )
-    })?;
-
-    if !runtime_ready(&app) {
-        return Err(format!(
-            "Boosty Loader {APP_VERSION}: установка завершилась, но runtime не готов (downloader/certifi/ffmpeg). Нажмите «Установить» ещё раз."
-        ));
+fn install_downloader(app: AppHandle, state: State<'_, DownloaderState>) -> Result<String, String> {
+    {
+        let mut guard = state
+            .0
+            .lock()
+            .map_err(|_| "Не удалось получить состояние установки")?;
+        if guard.installing {
+            return Err("Установка уже выполняется — подождите, это может занять несколько минут.".into());
+        }
+        guard.installing = true;
     }
 
-    Ok(format!("Boosty Downloader готов к работе (Loader {APP_VERSION})"))
+    let result = (|| {
+        let venv = venv_dir(&app)?;
+        emit(
+            &app,
+            "log",
+            format!("Boosty Loader {APP_VERSION}: готовлю изолированный runtime…"),
+        );
+        emit(
+            &app,
+            "log",
+            "Шаги: Python → пакеты → ffmpeg. Не закрывайте приложение.",
+        );
+
+        install_with_uv(&app, &venv).map_err(|error| {
+            format!(
+                "Boosty Loader {APP_VERSION}: установка не удалась.\n{error}\n\nУдалите папку Application Support/com.author.boosty-loader/downloader и нажмите «Установить» ещё раз."
+            )
+        })?;
+
+        if !runtime_ready(&app) {
+            return Err(format!(
+                "Boosty Loader {APP_VERSION}: установка завершилась, но runtime не готов (downloader/certifi/ffmpeg). Нажмите «Установить» ещё раз."
+            ));
+        }
+
+        Ok(format!(
+            "Boosty Downloader готов к работе (Loader {APP_VERSION})"
+        ))
+    })();
+
+    if let Ok(mut guard) = state.0.lock() {
+        guard.installing = false;
+    }
+    result
 }
 
 #[tauri::command]
@@ -785,7 +930,14 @@ fn start_download(
 
     let spec = prepare_download_command(&app, detected_spec)?;
     let args = build_download_args(&spec, &settings);
-    let mut child = build_process_command(&spec, &args, &runtime_dir(&app)?, ca_bundle.as_deref())
+    let tools_bin = managed_tools_bin(&app).ok();
+    let mut child = build_process_command(
+        &spec,
+        &args,
+        &runtime_dir(&app)?,
+        ca_bundle.as_deref(),
+        tools_bin.as_deref(),
+    )
         .spawn()
         .map_err(|error| format!("Не удалось запустить Boosty Downloader: {error}"))?;
 
@@ -946,7 +1098,7 @@ mod tests {
             prefix_args: vec![],
         };
         let ca_bundle = Path::new("/app/venv/certifi/cacert.pem");
-        let command = build_process_command(&spec, &[], Path::new("/app"), Some(ca_bundle));
+        let command = build_process_command(&spec, &[], Path::new("/app"), Some(ca_bundle), None);
         let ssl_cert_file = command
             .get_envs()
             .find(|(key, _)| *key == "SSL_CERT_FILE")
@@ -962,7 +1114,7 @@ mod tests {
             program: "boosty-downloader".into(),
             prefix_args: vec![],
         };
-        let command = build_process_command(&spec, &[], Path::new("/app"), None);
+        let command = build_process_command(&spec, &[], Path::new("/app"), None, None);
         let executable_path = command
             .get_envs()
             .find(|(key, _)| *key == "PATH")
