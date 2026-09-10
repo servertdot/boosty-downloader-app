@@ -1,6 +1,6 @@
 [package]
 name = "boosty-loader"
-version = "0.1.0"
+version = "0.1.1"
 description = "A friendly desktop interface for Boosty Downloader"
 authors = ["_"]
 edition = "2021"

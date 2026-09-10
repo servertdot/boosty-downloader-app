@@ -82,10 +82,32 @@ function App() {
   const logId = useRef(0); const logEnd = useRef<HTMLDivElement>(null);
 
   const refreshStatus = async () => setRuntime(await invoke<RuntimeStatus>("runtime_status"));
+  const installAttempted = useRef(false);
+
+  const install = async () => {
+    setBusy(true); setError(""); setNotice("Устанавливаю Boosty Downloader…");
+    try {
+      await invoke<string>("install_downloader");
+      await refreshStatus();
+      setNotice("Boosty Downloader готов к работе");
+    } catch (reason) {
+      setError(String(reason));
+      setNotice("");
+    } finally {
+      setBusy(false);
+    }
+  };
 
   useEffect(() => {
     void Promise.all([invoke<Settings>("load_settings"), invoke<RuntimeStatus>("runtime_status")])
-      .then(([saved, status]) => { setSettings(saved); setRuntime(status); })
+      .then(([saved, status]) => {
+        setSettings(saved);
+        setRuntime(status);
+        if (!status.installed && !installAttempted.current) {
+          installAttempted.current = true;
+          void install();
+        }
+      })
       .catch((reason) => setError(String(reason)));
     const unsubscribe = listen<DownloadEvent>("download-event", ({ payload }) => {
       const cleaned = { ...payload, message: payload.message.replace(ansiPattern, "") };
@@ -114,14 +136,13 @@ function App() {
     try { await openPath(path); } catch (reason) { setError(`Не удалось открыть папку: ${String(reason)}`); }
   };
   const save = async () => { if (!settings) return; setBusy(true); setError(""); try { await invoke("save_settings", { settings }); setNotice("Настройки сохранены локально"); } catch (reason) { setError(String(reason)); } finally { setBusy(false); } };
-  const install = async () => { setBusy(true); setError(""); setNotice("Устанавливаю Boosty Downloader…"); try { await invoke<string>("install_downloader"); await refreshStatus(); setNotice("Boosty Downloader готов к работе"); } catch (reason) { setError(String(reason)); setNotice(""); } finally { setBusy(false); } };
   const start = async () => { if (!settings) return; setBusy(true); setError(""); setNotice(""); setLogs([]); setProgress(null); try { await invoke("start_download", { settings }); setRuntime((current) => ({ ...current, running: true })); } catch (reason) { setError(String(reason)); } finally { setBusy(false); } };
   const stop = async () => { try { await invoke("stop_download"); } catch (reason) { setError(String(reason)); } };
 
   if (!settings) return <main className="loading"><span className="spinner" />Загружаем настройки…</main>;
 
   return <main className="app-shell">
-    <header className="topbar"><div className="brand"><div className="brand-mark"><img src="/app-icon.png" alt="" width={42} height={42} /></div><div><strong>Boosty Loader</strong><span>Сохраняйте доступный вам контент</span></div></div><div className={`runtime-pill ${runtime.installed ? "ready" : "missing"}`}><span className="status-dot" />{runtime.installed ? `Downloader ${runtime.version ?? "готов"}` : "Downloader не установлен"}{!runtime.installed && <button className="text-button" onClick={install} disabled={busy}>Установить</button>}</div></header>
+    <header className="topbar"><div className="brand"><div className="brand-mark"><img src="/app-icon.png" alt="" width={42} height={42} /></div><div><strong>Boosty Loader</strong><span>Сохраняйте доступный вам контент</span></div></div><div className={`runtime-pill ${runtime.installed ? "ready" : "missing"}`}><span className="status-dot" />{runtime.installed ? `Downloader ${runtime.version ?? "готов"}` : busy ? "Установка…" : "Downloader не установлен"}{!runtime.installed && <button className="text-button" onClick={install} disabled={busy}>{busy ? "Подождите" : "Установить"}</button>}</div></header>
     <div className="workspace"><section className="main-column">
       <div className="intro"><span className="eyebrow">Новая загрузка</span><h1>Загрузите материалы автора</h1><p>Приложение синхронизирует новые публикации и пропустит то, что уже было сохранено.</p></div>
       {(notice || error) && <div className={`notice ${error ? "notice-error" : "notice-success"}`}><Icon name={error ? "stop" : "check"} /><span>{error || notice}</span><button aria-label="Закрыть" onClick={() => { setNotice(""); setError(""); }}>×</button></div>}

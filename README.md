@@ -14,7 +14,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Tauri-2-orange?style=flat-square" alt="Tauri 2" />
   <img src="https://img.shields.io/badge/React-19-61dafb?style=flat-square" alt="React 19" />
-  <img src="https://img.shields.io/badge/Python-3.10%2B-3776ab?style=flat-square" alt="Python 3.10+" />
+  <img src="https://img.shields.io/badge/Python-auto--managed-3776ab?style=flat-square" alt="Python auto-managed" />
   <img src="https://img.shields.io/badge/powered%20by-boosty--downloader-brightgreen?style=flat-square" alt="powered by boosty-downloader" />
 </p>
 
@@ -52,18 +52,18 @@ The build is ad-hoc signed (not Apple-notarized). On first launch, use **right-c
 xattr -cr "/Applications/Boosty Loader.app"
 ```
 
-Then open it again. On first launch inside the app, click **Install** to set up the isolated Python environment.
+Then open it again. On first launch the app installs an isolated Python runtime and `boosty-downloader` automatically (no system Python required). If something fails, tap **Install** again.
 
 ## Quick start (from source)
 
-You need **Rust**, **Bun**, and **Python 3.10+**.
+You need **Rust** and **Bun**. Python is optional — the app can provision its own runtime.
 
 ```bash
 bun install
 bun run tauri dev
 ```
 
-On first launch, click **Install** at the top of the window. The app creates its own Python environment in the app data directory, installs `boosty-downloader` and an up-to-date `certifi` for HTTPS. System Python is left alone.
+On first launch the app sets up an isolated environment, installs `boosty-downloader`, and refreshes `certifi` for HTTPS. System Python is left alone.
 
 ## Build
 
