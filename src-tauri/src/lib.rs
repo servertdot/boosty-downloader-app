@@ -15,6 +15,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 const SETTINGS_FILE: &str = "settings.json";
 const CONFIG_FILE: &str = "config.yaml";
 const DOWNLOAD_EVENT: &str = "download-event";
+const PROGRESS_PREFIX: &str = "__BOOSTY_PROGRESS__";
 const LAUNCHER_FILE: &str = "boosty_launcher.py";
 const BOOSTY_LAUNCHER: &str = include_str!("../boosty_launcher.py");
 
@@ -72,6 +73,28 @@ struct RuntimeStatus {
 struct DownloadEvent {
     kind: String,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProgressPayload {
+    label: String,
+    percent: Option<f64>,
+    #[serde(default)]
+    detail: String,
+    #[serde(default = "default_progress_active")]
+    active: bool,
+}
+
+fn default_progress_active() -> bool {
+    true
 }
 
 #[derive(Default)]
@@ -258,6 +281,36 @@ fn emit(app: &AppHandle, kind: &str, message: impl Into<String>) {
         DownloadEvent {
             kind: kind.into(),
             message: message.into(),
+            percent: None,
+            label: None,
+            detail: None,
+            active: None,
+        },
+    );
+}
+
+fn emit_progress(app: &AppHandle, payload: ProgressPayload) {
+    let message = if payload.active {
+        match (payload.percent, payload.detail.as_str()) {
+            (Some(percent), detail) if !detail.is_empty() => {
+                format!("{} — {:.0}% · {}", payload.label, percent, detail)
+            }
+            (Some(percent), _) => format!("{} — {:.0}%", payload.label, percent),
+            (_, detail) if !detail.is_empty() => format!("{} — {}", payload.label, detail),
+            _ => payload.label.clone(),
+        }
+    } else {
+        String::new()
+    };
+    let _ = app.emit(
+        DOWNLOAD_EVENT,
+        DownloadEvent {
+            kind: "progress".into(),
+            message,
+            percent: payload.percent,
+            label: Some(payload.label),
+            detail: Some(payload.detail),
+            active: Some(payload.active),
         },
     );
 }
@@ -265,9 +318,19 @@ fn emit(app: &AppHandle, kind: &str, message: impl Into<String>) {
 fn forward_output<R: Read + Send + 'static>(reader: R, app: AppHandle, kind: &'static str) {
     thread::spawn(move || {
         for line in BufReader::new(reader).lines().map_while(Result::ok) {
-            if !line.trim().is_empty() {
-                emit(&app, kind, line);
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
             }
+            if kind == "log" {
+                if let Some(raw) = trimmed.strip_prefix(PROGRESS_PREFIX) {
+                    if let Ok(payload) = serde_json::from_str::<ProgressPayload>(raw) {
+                        emit_progress(&app, payload);
+                        continue;
+                    }
+                }
+            }
+            emit(&app, kind, line);
         }
     });
 }
@@ -637,5 +700,7 @@ mod tests {
     fn embeds_vimeo_compatibility_launcher() {
         assert!(BOOSTY_LAUNCHER.contains("player.vimeo.com"));
         assert!(BOOSTY_LAUNCHER.contains("boosty_referer"));
+        assert!(BOOSTY_LAUNCHER.contains(PROGRESS_PREFIX));
+        assert!(BOOSTY_LAUNCHER.contains("DesktopProgressReporter"));
     }
 }
