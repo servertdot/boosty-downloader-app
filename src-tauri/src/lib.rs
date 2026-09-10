@@ -292,19 +292,22 @@ fn ensure_local_ffmpeg(app: &AppHandle) -> Result<(), String> {
 
     emit(app, "log", "Скачиваю ffmpeg для внешних видео (Vimeo/YouTube)…");
     let python = managed_python(app)?;
-    let script = "import shutil, sys\n\
-from pathlib import Path\n\
-dest = Path(sys.argv[1])\n\
-src = None\n\
-found = shutil.which('ffmpeg')\n\
-if found:\n\
-    src = Path(found)\n\
-else:\n\
-    import imageio_ffmpeg\n\
-    src = Path(imageio_ffmpeg.get_ffmpeg_exe())\n\
-dest.parent.mkdir(parents=True, exist_ok=True)\n\
-shutil.copy2(src, dest)\n\
-print(dest)";
+    // Important: do not use `\` line continuations here — Rust strips leading
+    // whitespace on the next line and breaks Python indentation.
+    let script = r#"
+import shutil, sys
+from pathlib import Path
+dest = Path(sys.argv[1])
+found = shutil.which("ffmpeg")
+if found:
+    src = Path(found)
+else:
+    import imageio_ffmpeg
+    src = Path(imageio_ffmpeg.get_ffmpeg_exe())
+dest.parent.mkdir(parents=True, exist_ok=True)
+shutil.copy2(src, dest)
+print(dest)
+"#;
     let output = Command::new(&python)
         .args(["-c", script])
         .arg(&destination)
